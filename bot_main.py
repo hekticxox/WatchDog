@@ -16,7 +16,7 @@ from indicators.stochastic import compute_stochastic
 from indicators.vwap import compute_vwap
 from indicators.moving_average import compute_ema, compute_sma
 from strategies.multi_factor import multi_factor_signal
-from data.kucoin_orders import place_order, close_position, grid_place_order
+from data.kucoin_orders import place_order, grid_place_order, _get_headers
 from data.risk import calculate_position_size
 import csv
 import os
@@ -25,17 +25,24 @@ import uuid
 import requests
 import hmac
 import base64
-from dotenv import load_dotenv
-from telegram_notify import send_telegram_message
-import signal
 import json
-import statistics
+from dotenv import load_dotenv
+import os
 
-load_dotenv()
+# Define the base URL for KuCoin Futures API
+BASE_URL = "https://api-futures.kucoin.com"
+
+# Load .env from the .gitignore directory
+env_path = os.path.join(os.path.dirname(__file__), ".gitignore", ".env")
+if not os.path.exists(env_path):
+    raise FileNotFoundError(f".env file not found at {env_path}")
+load_dotenv(dotenv_path=env_path)
+
 API_KEY = os.getenv("KUCOIN_API_KEY")
 API_SECRET = os.getenv("KUCOIN_API_SECRET")
 API_PASSPHRASE = os.getenv("KUCOIN_API_PASSPHRASE")
-BASE_URL = os.getenv("BASE_URL", "https://api-futures.kucoin.com")
+if not API_KEY or not API_SECRET or not API_PASSPHRASE:
+    raise ValueError("One or more KUCOIN API environment variables are not set. Please check your .env file.")
 
 CSV_FILE = "signal_log.csv"
 
@@ -49,26 +56,6 @@ def log_signal_to_csv(row):
                 "ST_K", "ST_D", "VWAP", "EMA21", "SMA50", "FundingRate", "OpenInterest", "SIGNAL"
             ])
         writer.writerow(row)
-
-def _get_headers(endpoint, method, body=""):
-    now = str(int(time.time() * 1000))
-    if body and isinstance(body, dict):
-        body = json.dumps(body)
-    str_to_sign = f"{now}{method}{endpoint}{body}"
-    signature = base64.b64encode(
-        hmac.new(API_SECRET.encode(), str_to_sign.encode(), digestmod="sha256").digest()
-    ).decode()
-    passphrase = base64.b64encode(
-        hmac.new(API_SECRET.encode(), API_PASSPHRASE.encode(), digestmod="sha256").digest()
-    ).decode()
-    return {
-        "KC-API-TIMESTAMP": now,
-        "KC-API-KEY": API_KEY,
-        "KC-API-SIGN": signature,
-        "KC-API-PASSPHRASE": passphrase,
-        "KC-API-KEY-VERSION": "2",
-        "Content-Type": "application/json",
-    }
 
 def save_bad_symbols(bad_symbols, filename="bad_symbols.txt"):
     with open(filename, "w") as f:
@@ -84,6 +71,32 @@ def load_bad_symbols(filename="bad_symbols.txt"):
 def fetch_open_positions():
     endpoint = "/api/v1/positions"
     url = BASE_URL + endpoint
+    # _get_headers is now only used here, so define it locally
+    def _get_headers(endpoint, method, body=""):
+        if API_KEY is None:
+            raise ValueError("KUCOIN_API_KEY environment variable is not set.")
+        if API_SECRET is None:
+            raise ValueError("KUCOIN_API_SECRET environment variable is not set.")
+        if isinstance(body, dict):
+            body = json.dumps(body)
+        now = str(int(time.time() * 1000))
+        str_to_sign = f"{now}{method}{endpoint}{body}"
+        signature = base64.b64encode(
+            hmac.new(API_SECRET.encode(), str_to_sign.encode(), digestmod="sha256").digest()
+        ).decode()
+        if API_PASSPHRASE is None:
+            raise ValueError("KUCOIN_API_PASSPHRASE environment variable is not set.")
+        passphrase = base64.b64encode(
+            hmac.new(API_SECRET.encode(), API_PASSPHRASE.encode(), digestmod="sha256").digest()
+        ).decode()
+        return {
+            "KC-API-TIMESTAMP": now,
+            "KC-API-KEY": API_KEY,
+            "KC-API-SIGN": signature,
+            "KC-API-PASSPHRASE": passphrase,
+            "KC-API-KEY-VERSION": "2",
+            "Content-Type": "application/json"
+        }
     headers = _get_headers(endpoint, "GET")
     try:
         resp = requests.get(url, headers=headers, timeout=10)
@@ -157,19 +170,31 @@ class TimeoutException(Exception):
     pass
 
 def timeout_handler(signum, frame):
-    raise TimeoutException
+    pass  # You can implement your timeout logic here if needed
+
+import sys
+import threading
 
 def input_with_timeout(prompt, timeout=30):
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(timeout)
-    try:
-        value = input(prompt)
-        signal.alarm(0)
-        return value
-    except TimeoutException:
+    """
+    Cross-platform input with timeout.
+    """
+    result = [None]
+
+    def get_input():
+        try:
+            result[0] = input(prompt)
+        except Exception:
+            result[0] = None
+
+    thread = threading.Thread(target=get_input)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
         print("\nNo input received, proceeding with no trades.")
-        signal.alarm(0)
         return None
+    return result[0]
 
 def fetch_klines_with_fallback(symbol, start, end):
     """
@@ -181,7 +206,7 @@ def fetch_klines_with_fallback(symbol, start, end):
     # Fallback: try Binance (convert symbol if needed)
     binance_symbol = symbol.replace("USDTM", "USDT")
     try:
-        from fetch_binance_klines import fetch_binance_klines
+        from data.binance_data import fetch_binance_klines
         # Use 1m interval, limit 500, and pass start/end as ms timestamps
         data = fetch_binance_klines(binance_symbol, interval="1m", start_time=start, end_time=end, limit=500)
         if data and len(data) >= 20:
@@ -224,7 +249,7 @@ def main(trade_mode=True):
         end = int(datetime.now().timestamp() * 1000)
         # Fetch more data for indicators
         start = int((datetime.now() - timedelta(minutes=300)).timestamp() * 1000)
-        data = fetch_klines_rest(symbol, start, end)
+        data = fetch_klines_with_fallback(symbol, start, end)
         if not data or len(data) < 60:
             print(f"Not enough data for {symbol}")
             continue
@@ -258,7 +283,6 @@ def main(trade_mode=True):
         sma50 = compute_sma(df["close"], window=50)
         last_sma50 = sma50.iloc[-1]
 
-
         funding_rate = fetch_funding_rate(symbol)
         open_interest = fetch_open_interest(symbol)
 
@@ -268,10 +292,8 @@ def main(trade_mode=True):
             last_stoch_k, last_stoch_d, last_vwap
         )
 
-        # --- Calculate signal points (reuse your dashboard2 logic or define here) ---
         def calculate_signal_points_for_main():
             points = 0
-            # Example: match your dashboard2.py logic
             if last_rsi < 35:
                 points += 1
             if last_macd > 0:
@@ -280,12 +302,10 @@ def main(trade_mode=True):
                 points += 1
             if last_stoch_k < 20 and last_stoch_d < 20:
                 points += 1
-            # Add more confluence checks as needed
             return points
 
         points = calculate_signal_points_for_main()
 
-        # Require at least 3 points for a "buy" or "sell" to be considered
         if signal in ["buy", "sell"] and points < 3:
             signal = "hold"
 
@@ -321,10 +341,7 @@ def main(trade_mode=True):
         else:
             imbalance = None
 
-        # Trading logic (example)
-        # Account parameters (replace with real values)
         pos = open_positions.get(symbol)
-        # Always check for close logic if position exists
         if pos:
             if (pos["side"] == "buy" and signal == "sell") or (pos["side"] == "sell" and signal == "buy"):
                 if trade_mode:
@@ -337,24 +354,41 @@ def main(trade_mode=True):
                     else:
                         print(f"Skipped closing {pos['side']} position for {symbol}.")
                 else:
-                    # Monitor mode: close automatically
                     print(f"\n[Monitor Mode] Auto-closing {pos['side']} position for {symbol}, size={pos['size']}.")
                     client_oid = str(uuid.uuid4())
                     response = close_position(symbol, pos["side"], pos["size"], client_oid=client_oid)
                     print(f"Closed {pos['side']} position for {symbol}, size={pos['size']}. Response: {response}")
-            continue  # Do not consider new entries for open positions
+            continue
+        
+        def close_position(symbol, side, size, client_oid=None):
+            """
+            Close a position by placing a market order in the opposite direction.
+            """
+            order_side = "sell" if side == "buy" else "buy"
+            if client_oid is None:
+                client_oid = str(uuid.uuid4())
+            try:
+                response = place_order(
+                    symbol, order_side, size,
+                    client_oid=client_oid,
+                    leverage=5,
+                    order_type="market",
+                    reduce_only=True
+                )
+                return response
+            except Exception as e:
+                print(f"Error closing position for {symbol}: {e}")
+                return None
 
-        # Only add new trades if in trade_mode
         if trade_mode and signal in ["buy", "sell"] and not pos:
             trade_candidates.append({
                 "symbol": symbol,
                 "signal": signal,
                 "rsi": last_rsi,
-                "size": None,  # Will calculate after sorting
+                "size": None,
                 "stop_loss_pct": stop_loss_pct
             })
 
-    # --- Sort trade candidates: buys (lowest RSI first), sells (highest RSI first) ---
     buys = [t for t in trade_candidates if t["signal"] == "buy"]
     sells = [t for t in trade_candidates if t["signal"] == "sell"]
     buys.sort(key=lambda x: x["rsi"])
@@ -370,9 +404,6 @@ def main(trade_mode=True):
             message = "Top 5 Buy Candidates:\n"
             for t in top_5_buys:
                 message += f"{t['symbol']} (RSI={t['rsi']:.2f})\n"
-            send_telegram_message(message)
-
-            # <-- Add the file writing code here
             with open("top_candidates.txt", "w") as f:
                 for t in top_5_buys:
                     f.write(f"{t['symbol']}\n")
@@ -380,7 +411,7 @@ def main(trade_mode=True):
         to_trade = input_with_timeout("Enter numbers of trades to execute (comma separated, or 'all'): ", timeout=30)
         if not to_trade:
             print("No trades selected. Will rerun in 1 minute.")
-            return  # Skip to next loop
+            return
         if to_trade.lower() == "all":
             selected = sorted_trades
         else:
@@ -396,9 +427,9 @@ def main(trade_mode=True):
                 for t in selected:
                     while True:
                         try:
-                            amt = float(input(f"Enter the USDT amount you want to use for {t['symbol']}: ").strip())
-                            if amt > 0:
-                                usd_amounts.append(amt)
+                            per_trade_amount = float(input(f"Enter the USDT amount you want to use for {t['symbol']}: ").strip())
+                            if per_trade_amount > 0:
+                                usd_amounts.append(per_trade_amount)
                                 break
                             else:
                                 print("Please enter a positive number.")
@@ -406,7 +437,7 @@ def main(trade_mode=True):
                             print("Invalid input. Please enter a number.")
 
                 # Now execute only selected trades, using the specific amount for each
-                for t, usd_amount in zip(selected, usd_amounts):
+                for t, per_trade_amount in zip(selected, usd_amounts):
                     account_equity = fetch_account_equity()  # Fetch fresh balance for each trade
                     if account_equity is None or account_equity <= 5:
                         print(f"Account equity too low for {t['symbol']}, skipping.")
@@ -422,16 +453,18 @@ def main(trade_mode=True):
                     df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
                     df["close"] = df["close"].astype(float)
                     price = float(df["close"].iloc[-1])
-                    size = usd_amount / price
+                    size = per_trade_amount / price
                     # If your exchange requires integer or step size, round appropriately here
                     notional = size * price
                     required_margin = notional / leverage
 
                     if required_margin > account_equity:
                         print(f"Required margin {required_margin:.2f} exceeds account equity {account_equity:.2f} for {t['symbol']}, reducing size.")
-                        min_size = 1
+                        min_size = 0.01  # Adjust as needed for your asset's minimum size
+                        step_size = 0.01  # Adjust as needed for your asset's step size
                         while size > min_size:
-                            size -= 1
+                            size -= step_size
+                            size = round(size, 6)  # Prevent floating point issues
                             notional = size * price
                             required_margin = notional / leverage
                             if required_margin <= account_equity:
@@ -451,58 +484,11 @@ def main(trade_mode=True):
                         print(f"Placed {t['signal']} order for {t['symbol']}, size={size}, leverage={leverage}. Response: {response}")
                     else:
                         print(f"Calculated size is 0 for {t['symbol']}, skipping order.")
+                break
             except Exception:
                 print("Invalid input. Please enter a number.")
-
-        # Now execute only selected trades
-        for t in selected:
-            account_equity = fetch_account_equity()  # Fetch fresh balance for each trade
-            if account_equity is None or account_equity <= 5:
-                print(f"Account equity too low for {t['symbol']}, skipping.")
-                continue
-            leverage = 5
-            # Fetch latest price for the symbol
-            end = int(datetime.now().timestamp() * 1000)
-            start = end - 60 * 60 * 1000
-            data = fetch_klines_rest(t["symbol"], start, end)
-            if not data or len(data) < 1:
-                print(f"Could not get price for {t['symbol']}, skipping.")
-                continue
-            df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
-            df["close"] = df["close"].astype(float)
-            price = float(df["close"].iloc[-1])
-            size = int((usd_amount * leverage) / price)
-            notional = size * price
-            required_margin = notional / leverage
-
-            if required_margin > account_equity:
-                print(f"Required margin {required_margin:.2f} exceeds account equity {account_equity:.2f} for {t['symbol']}, reducing size.")
-                min_size = 1
-                while size > min_size:
-                    size -= 1
-                    notional = size * price
-                    required_margin = notional / leverage
-                    if required_margin <= account_equity:
-                        break
-                if size <= min_size:
-                    print(f"Could not find suitable size for {t['symbol']}, skipping order.")
-                    continue
-
-            if size > 0:
-                client_oid = str(uuid.uuid4())
-                response = place_order(
-                    t["symbol"], t["signal"], size,
-                    client_oid=client_oid,
-                    leverage=leverage,
-                    order_type="market"
-                )
-                print(f"Placed {t['signal']} order for {t['symbol']}, size={size}, leverage={leverage}. Response: {response}")
-            else:
-                print(f"Calculated size is 0 for {t['symbol']}, skipping order.")
     else:
-        print("Monitor only mode: No new trades will be placed.")
-
-    save_bad_symbols(bad_symbols)
+        save_bad_symbols(bad_symbols)
 
 def set_trailing_stop(symbol, side, trailing_stop, api_key, api_secret, api_passphrase):
     """
@@ -529,6 +515,26 @@ def set_trailing_stop(symbol, side, trailing_stop, api_key, api_secret, api_pass
         return resp.json()
     except Exception as e:
         print(f"Error setting trailing stop for {symbol}: {e}")
+        return None
+
+def close_position(symbol, side, size, client_oid=None):
+    """
+    Close a position by placing a market order in the opposite direction.
+    """
+    order_side = "sell" if side == "buy" else "buy"
+    if client_oid is None:
+        client_oid = str(uuid.uuid4())
+    try:
+        response = place_order(
+            symbol, order_side, size,
+            client_oid=client_oid,
+            leverage=5,
+            order_type="market",
+            reduce_only=True
+        )
+        return response
+    except Exception as e:
+        print(f"Error closing position for {symbol}: {e}")
         return None
 
 def set_dynamic_trailing_stop_for_open_positions():
@@ -587,7 +593,7 @@ def set_dynamic_trailing_stop_for_open_positions():
             amount = pos.get("size", "-")
             liq_price = pos.get("liquidationPrice", "-")
             margin = pos.get("margin", "-")
-            unrealized_pnl = pos.get("unrealizedPNL", "-")
+            unrealized_pnl = pos.get("unrealisedPNL", "-")
             roi = pos.get("roi", "-")
 
             # Update trailing stop if price moves favorably
@@ -632,7 +638,7 @@ def set_dynamic_trailing_stop_for_open_positions():
             break
 
         time.sleep(10)  # Check every 10 seconds
-
+        # trailing_stop.py is where the function has moved
 # You need to implement fetch_open_positions_full() to return all the extra info for each position.
 # You can adapt your fetch_open_positions() to include entryPrice, liquidationPrice, margin, unrealizedPNL, roi, etc.
 def main_loop():
