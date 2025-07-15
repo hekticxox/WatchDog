@@ -6,10 +6,10 @@ import base64
 import math  # <-- Add this line
 from dotenv import load_dotenv
 import asyncio
-from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Static
-from textual.reactive import reactive
+from textual.app import App, ComposeResult # type: ignore # type: ignore
+from textual.containers import Horizontal, Vertical # type: ignore
+from textual.widgets import Static # type: ignore
+from textual.reactive import reactive # type: ignore
 import pandas as pd
 from indicators.rsi import compute_rsi
 from indicators.macd import compute_macd

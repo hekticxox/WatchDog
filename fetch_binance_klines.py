@@ -2,7 +2,14 @@ import requests
 import pandas as pd
 import time
 
-def fetch_binance_klines(symbol, interval="1m", limit=1000, start_time=None, end_time=None):
+def fetch_binance_klines(symbol, interval="1m", start_time=None, end_time=None, limit=500):
+    """
+    Fetch klines from Binance Futures.
+    symbol: e.g. "BTCUSDT"
+    interval: e.g. "1m"
+    start_time, end_time: ms timestamps
+    limit: max 1500
+    """
     url = "https://fapi.binance.com/fapi/v1/klines"
     params = {
         "symbol": symbol,
@@ -13,18 +20,9 @@ def fetch_binance_klines(symbol, interval="1m", limit=1000, start_time=None, end
         params["startTime"] = int(start_time)
     if end_time:
         params["endTime"] = int(end_time)
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-    data = response.json()
-    # Columns: open_time, open, high, low, close, volume, close_time, ...
-    df = pd.DataFrame(data, columns=[
-        "timestamp", "open", "high", "low", "close", "volume",
-        "close_time", "quote_asset_volume", "number_of_trades",
-        "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
-    ])
-    df["symbol"] = symbol
-    df["close"] = df["close"].astype(float)
-    return df[["timestamp", "symbol", "close"]]
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
 
 if __name__ == "__main__":
     # Example: Download 1-minute klines for BTCUSDT for the last 2 days
@@ -36,7 +34,7 @@ if __name__ == "__main__":
     for i in range(2):  # 2 days
         start = now - (i + 1) * one_day_ms
         end = now - i * one_day_ms
-        df = fetch_binance_klines(symbol, interval, 1000, start, end)
+        df = fetch_binance_klines(symbol, interval, start, end)
         all_dfs.append(df)
         time.sleep(1)  # avoid rate limits
     result = pd.concat(all_dfs).drop_duplicates()

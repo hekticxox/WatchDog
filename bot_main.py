@@ -16,7 +16,7 @@ from indicators.stochastic import compute_stochastic
 from indicators.vwap import compute_vwap
 from indicators.moving_average import compute_ema, compute_sma
 from strategies.multi_factor import multi_factor_signal
-from data.kucoin_orders import place_order, close_position
+from data.kucoin_orders import place_order, close_position, grid_place_order
 from data.risk import calculate_position_size
 import csv
 import os
@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 from telegram_notify import send_telegram_message
 import signal
 import json
+import statistics
 
 load_dotenv()
 API_KEY = os.getenv("KUCOIN_API_KEY")
@@ -148,7 +149,8 @@ def get_user_mode():
     print("1. Trade & Monitor (scan, then confirm trades)")
     print("2. Monitor Only (no new trades, just monitor/close)")
     print("3. Set Dynamic Trailing Stop loss with open position")
-    mode = input("Enter 1, 2 or 3: ").strip()
+    print("4. AI Volatility Grid Bot (auto grid trade best coin)")
+    mode = input("Enter 1, 2, 3 or 4: ").strip()
     return mode
 
 class TimeoutException(Exception):
@@ -180,10 +182,23 @@ def fetch_klines_with_fallback(symbol, start, end):
     binance_symbol = symbol.replace("USDTM", "USDT")
     try:
         from fetch_binance_klines import fetch_binance_klines
-        data = fetch_binance_klines(binance_symbol, start, end)
+        # Use 1m interval, limit 500, and pass start/end as ms timestamps
+        data = fetch_binance_klines(binance_symbol, interval="1m", start_time=start, end_time=end, limit=500)
         if data and len(data) >= 20:
-            print(f"Fetched {len(data)} klines for {symbol} from Binance as fallback.")
-            return data
+            # Convert Binance kline format to match KuCoin: [timestamp, open, high, low, close, volume]
+            formatted = [
+                [
+                    int(row[0]),          # open time
+                    float(row[1]),        # open
+                    float(row[2]),        # high
+                    float(row[3]),        # low
+                    float(row[4]),        # close
+                    float(row[5])         # volume
+                ]
+                for row in data
+            ]
+            print(f"Fetched {len(formatted)} klines for {symbol} from Binance as fallback.")
+            return formatted
     except Exception as e:
         print(f"Binance fallback failed for {symbol}: {e}")
     print(f"Could not get enough price data for {symbol} from any source.")
@@ -376,10 +391,66 @@ def main(trade_mode=True):
         while True:
             try:
                 usd_amount = float(input("Enter the USDT amount you want to use for each trade: ").strip())
-                if usd_amount > 0:
-                    break
-                else:
-                    print("Please enter a positive number.")
+                # Ask user for $ amount per trade, individually
+                usd_amounts = []
+                for t in selected:
+                    while True:
+                        try:
+                            amt = float(input(f"Enter the USDT amount you want to use for {t['symbol']}: ").strip())
+                            if amt > 0:
+                                usd_amounts.append(amt)
+                                break
+                            else:
+                                print("Please enter a positive number.")
+                        except Exception:
+                            print("Invalid input. Please enter a number.")
+
+                # Now execute only selected trades, using the specific amount for each
+                for t, usd_amount in zip(selected, usd_amounts):
+                    account_equity = fetch_account_equity()  # Fetch fresh balance for each trade
+                    if account_equity is None or account_equity <= 5:
+                        print(f"Account equity too low for {t['symbol']}, skipping.")
+                        continue
+                    leverage = 5
+                    # Fetch latest price for the symbol
+                    end = int(datetime.now().timestamp() * 1000)
+                    start = end - 60 * 60 * 1000
+                    data = fetch_klines_rest(t["symbol"], start, end)
+                    if not data or len(data) < 1:
+                        print(f"Could not get price for {t['symbol']}, skipping.")
+                        continue
+                    df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
+                    df["close"] = df["close"].astype(float)
+                    price = float(df["close"].iloc[-1])
+                    size = usd_amount / price
+                    # If your exchange requires integer or step size, round appropriately here
+                    notional = size * price
+                    required_margin = notional / leverage
+
+                    if required_margin > account_equity:
+                        print(f"Required margin {required_margin:.2f} exceeds account equity {account_equity:.2f} for {t['symbol']}, reducing size.")
+                        min_size = 1
+                        while size > min_size:
+                            size -= 1
+                            notional = size * price
+                            required_margin = notional / leverage
+                            if required_margin <= account_equity:
+                                break
+                        if size <= min_size:
+                            print(f"Could not find suitable size for {t['symbol']}, skipping order.")
+                            continue
+
+                    if size > 0:
+                        client_oid = str(uuid.uuid4())
+                        response = place_order(
+                            t["symbol"], t["signal"], size,
+                            client_oid=client_oid,
+                            leverage=leverage,
+                            order_type="market"
+                        )
+                        print(f"Placed {t['signal']} order for {t['symbol']}, size={size}, leverage={leverage}. Response: {response}")
+                    else:
+                        print(f"Calculated size is 0 for {t['symbol']}, skipping order.")
             except Exception:
                 print("Invalid input. Please enter a number.")
 
@@ -568,8 +639,13 @@ def main_loop():
     mode = get_user_mode()
     trade_mode = (mode == "1")
     trailing_stop_mode = (mode == "3")
+    grid_mode = (mode == "4")
     while True:
-        if trailing_stop_mode:
+        if grid_mode:
+            ai_volatility_grid_bot()
+            print("Sleeping for 1 minute before next grid scan...")
+            time.sleep(60)
+        elif trailing_stop_mode:
             set_dynamic_trailing_stop_for_open_positions()
             print("Sleeping for 1 minute before next trailing stop update...")
             time.sleep(60)
@@ -592,6 +668,139 @@ def select_positions(open_positions):
         return symbols
     idxs = [int(x.strip())-1 for x in selection.split(",") if x.strip().isdigit()]
     return [symbols[i] for i in idxs if 0 <= i < len(symbols)]
+
+def ai_volatility_grid_bot():
+    # 1. Scan for top coins (use your existing logic)
+    print("Scanning for top grid trade candidates...")
+    symbols = [s for s in fetch_active_symbols() if s.endswith("USDTM")]
+    candidates = []
+    for symbol in symbols:
+        end = int(datetime.now().timestamp() * 1000)
+        start = end - 60 * 60 * 1000
+        data = fetch_klines_with_fallback(symbol, start, end)
+        if not data or len(data) < 20:
+            continue
+        df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
+        df["close"] = df["close"].astype(float)
+        # Use ATR as a volatility proxy
+        atr = compute_atr(df["high"], df["low"], df["close"]).iloc[-1]
+        last_close = df["close"].iloc[-1]
+        volatility = atr / last_close
+        candidates.append((symbol, volatility, last_close))
+    # Sort by highest volatility
+    candidates.sort(key=lambda x: -x[1])
+    print("\nTop grid candidates by volatility:")
+    for i, (symbol, vol, price) in enumerate(candidates[:10], 1):
+        print(f"{i}. {symbol} | Volatility: {vol:.4f} | Price: {price:.6f}")
+
+    # 2. Let user pick a coin
+    idx = input("Enter the number of the coin to grid trade (or 'q' to cancel): ").strip()
+    if idx.lower() == "q":
+        print("Cancelled grid bot.")
+        return
+    try:
+        idx = int(idx) - 1
+        symbol, volatility, last_price = candidates[idx]
+    except Exception:
+        print("Invalid selection.")
+        return
+
+    # 3. Ask user for USDT allocation
+    while True:
+        try:
+            usdt_amount = float(input("Enter the USDT amount to use for grid trading: ").strip())
+            if usdt_amount > 0:
+                break
+            else:
+                print("Please enter a positive number.")
+        except Exception:
+            print("Invalid input. Please enter a number.")
+
+    # 4. Ask for grid parameters (optional: use defaults)
+    grid_levels = 10
+    leverage = 5
+    trailing_stop_percent = 0.5
+    take_profit_percent = 2
+    check_interval = 10
+
+    print(f"\n[AI GRID BOT] Starting grid on {symbol} with {usdt_amount} USDT, {grid_levels} levels, leverage {leverage}x.")
+
+    # 5. Start the grid bot loop
+    price_history = []
+    def fetch_market_price():
+        r = requests.get(f"{BASE_URL}/api/v1/mark-price/{symbol}/current")
+        price = float(r.json()['data']['value'])
+        price_history.append(price)
+        if len(price_history) > 10:
+            price_history.pop(0)
+        return price
+
+    def estimate_volatility():
+        if len(price_history) < 2:
+            return 0.005  # default spacing 0.5%
+        stddev = statistics.stdev(price_history)
+        avg_price = statistics.mean(price_history)
+        return stddev / avg_price
+
+    def place_trailing_stop(side, entry_price, size):
+        offset = trailing_stop_percent / 100 * entry_price
+        trigger_price = entry_price + offset if side == "buy" else entry_price - offset
+        stop_side = "sell" if side == "buy" else "buy"
+        order = {
+            "clientOid": str(uuid.uuid4()),
+            "symbol": symbol,
+            "side": stop_side,
+            "type": "trailingStop",
+            "triggerPrice": str(trigger_price),
+            "triggerPriceType": "last",
+            "stop": "entry",
+            "size": str(size),
+            "reduceOnly": True
+        }
+        # You may need to implement this with your exchange's API
+        print(f"[TRAILING STOP] {side} entry, placing {stop_side} SL at {trigger_price:.6f} for {size:.4f} {symbol}")
+
+    # Calculate base order size per grid (use margin allocation, not notional)
+    # For isolated margin, margin required ≈ (order_size * price) / leverage
+    base_order_margin = usdt_amount / (2 * grid_levels)  # split between buy and sell
+    base_order_size = (base_order_margin * leverage) / last_price
+
+    # Fetch minimum order size for the symbol (hardcode or fetch from API)
+    MIN_NOTIONAL = 5  # USDT, adjust as needed for your symbol
+
+    # Calculate max possible size per order based on margin and notional
+    base_order_margin = usdt_amount / (2 * grid_levels)
+    base_order_size = (base_order_margin * leverage) / last_price
+
+    # Ensure notional is above minimum
+    min_size = MIN_NOTIONAL / last_price
+    if base_order_size < min_size:
+        base_order_size = min_size
+        print(f"[WARN] Order size increased to meet minimum notional: {base_order_size:.4f} {symbol}")
+
+    print(f"[INFO] Each grid order size: {base_order_size:.4f} {symbol}, margin per order: {base_order_margin:.4f} USDT, notional: {base_order_size * last_price:.4f} USDT")
+
+    while True:
+        try:
+            price = fetch_market_price()
+            spacing = estimate_volatility() * price
+            print(f"[INFO] Current Price: {price:.6f} | Volatility-adjusted spacing: {spacing:.6f}")
+
+            for i in range(1, grid_levels + 1):
+                buy_price = round(price - (i * spacing), 6)
+                sell_price = round(price + (i * spacing), 6)
+                size_buy = base_order_size
+                size_sell = base_order_size
+                grid_place_order(symbol, "buy", buy_price, size_buy, leverage)
+                grid_place_order(symbol, "sell", sell_price, size_sell, leverage)
+                place_trailing_stop("buy", buy_price, size_buy)
+                place_trailing_stop("sell", sell_price, size_sell)
+
+            print("[GRID] Sleeping before next grid placement...")
+            time.sleep(check_interval)
+        except Exception as e:
+            print(f"[ERROR] Exception in grid bot loop: {e}")
+            time.sleep(check_interval)
 
 if __name__ == "__main__":
     main_loop()

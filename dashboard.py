@@ -1,5 +1,5 @@
-from textual.app import App, ComposeResult
-from textual.widgets import DataTable
+from textual.app import App, ComposeResult # type: ignore
+from textual.widgets import DataTable # type: ignore
 import pandas as pd
 import requests
 
@@ -63,9 +63,14 @@ class SignalTableApp(App):
         self.table.scroll_y = scroll_y
         self.table.move_cursor(row=selected_row, column=0)
 
+    def fetch_klines_rest(symbol, start, end):
+        # Dummy implementation, replace with actual KuCoin REST API call as needed
+        # Return empty list to trigger Binance fallback for now
+        return []
+
     def fetch_klines(symbol, start, end, interval="1m"):
         # Try KuCoin first
-        data = fetch_klines_rest(symbol, start, end)
+        data = SignalTableApp.fetch_klines_rest(symbol, start, end)
         if data and len(data) > 50:
             return data
         # Fallback to Binance
